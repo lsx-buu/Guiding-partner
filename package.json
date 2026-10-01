@@ -30,16 +30,23 @@
     {
       "name": "C3H3-AI",
       "url": "https://github.com/C3H3-AI"
+    },
+    {
+      "name": "lsx-buu",
+      "url": "https://github.com/lsx-buu"
     }
   ],
   "license": "MIT",
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xmanrui/dsh-im.git"
+    "url": "git+https://github.com/lsx-buu/Guiding-partner.git"
   },
-  "homepage": "https://github.com/xmanrui/dsh-im#readme",
-  "bugs": "https://github.com/xmanrui/dsh-im/issues",
+  "homepage": "https://github.com/lsx-buu/Guiding-partner#readme",
+  "bugs": "https://github.com/lsx-buu/Guiding-partner/issues",
   "publishConfig": {
     "access": "public"
   },
@@ -83,6 +90,8 @@
   "scripts": {
     "build": "node plugin-src/client/build.mjs && node plugin-src/host/build.mjs",
     "test": "node --test test/*.test.mjs test/channels/*/*.test.mjs",
+    "test:companion": "npm --workspace packages/dsh-companion test",
+    "check:companion": "npm --workspace packages/dsh-companion run check",
     "check": "npm test && npm run build && node scripts/verify-package.mjs"
   },
   "engines": {

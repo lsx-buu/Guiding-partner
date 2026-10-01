@@ -120,6 +120,7 @@ export async function createProductionController(ctx, config = {}, internals = {
           info: (...args) => logger.info?.(`[${botId}]`, ...args),
           debug: (...args) => logger.debug?.(`[${botId}]`, ...args),
         },
+        dshImGatewayRegistry: config.dshImGatewayRegistry,
       });
     },
     deleteState: async ({ botId }) => {

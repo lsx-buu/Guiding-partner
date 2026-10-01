@@ -64,6 +64,34 @@ function message(overrides = {}) {
   };
 }
 
+test('QQ explicit-owner sticker is intercepted before Harness', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  const dispatched = [];
+  const registry = {
+    upsertTrustedRoute: () => ({ routeId: 'qq-capture-route' }),
+    recordInbound: () => {},
+    dispatchInbound: async (_routeId, inbound) => {
+      dispatched.push(inbound);
+      return { handled: true, replies: ['收下了，第 1 张。'] };
+    },
+  };
+  const bridge = new QqHarnessBridge({
+    bot: { sendText: async (_target, text) => sent.push(text) },
+    ownerUserOpenid: 'owner-openid', botId: 'qq-test', state: fixture.state,
+    dshImGatewayRegistry: registry,
+    harness: { ask: async () => { throw new Error('Harness must not be called'); } },
+  });
+  await bridge.accept(message({
+    messageId: 'qq-capture', content: '',
+    attachments: [{ filename: 'sticker.png', content_type: 'image/png', url: 'https://img.example/sticker.png' }],
+  }));
+  assert.equal(dispatched.length, 1);
+  assert.equal(typeof dispatched[0].images[0].load, 'function');
+  assert.deepEqual(sent, ['收下了，第 1 张。']);
+  assert.equal(fixture.seen.has('qq-capture'), true);
+});
+
 async function committedArtifact(t, fileName, content, suffix) {
   const workspace = await mkdtemp(join(tmpdir(), `dsh-im-qq-artifact-${suffix}-`));
   t.after(() => rm(workspace, { recursive: true, force: true }));

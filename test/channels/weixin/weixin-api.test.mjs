@@ -201,6 +201,7 @@ test('sendText emits the iLink message envelope without reflecting the token in 
   assert.equal(calls[0].init.headers.Authorization, 'Bearer host-only-token');
   const body = JSON.parse(calls[0].init.body);
   assert.equal(body.msg.to_user_id, 'wx-user');
+  assert.match(body.msg.client_id, /^openclaw-weixin:\d{13}-[0-9a-f]{8}$/);
   assert.equal(body.msg.context_token, 'message-context');
   assert.equal(body.msg.item_list[0].text_item.text, 'Harness reply');
   assert.equal(body.base_info.channel_version, '2.4.6');
@@ -265,7 +266,7 @@ test('sendFile uses the iLink 2.4.6 encrypted CDN flow and sends a native file i
   const sent = JSON.parse(calls[2].init.body).msg;
   assert.equal(sent.context_token, 'message-context');
   assert.equal(sent.run_id, 'run-1');
-  assert.match(sent.client_id, /^dsh-weixin-[0-9a-f]{32}$/);
+  assert.match(sent.client_id, /^openclaw-weixin:\d{13}-[0-9a-f]{8}$/);
   assert.equal(result.messageId, sent.client_id);
   assert.deepEqual(sent.item_list, [{
     type: 4,
@@ -336,7 +337,7 @@ test('sendImage uses the encrypted CDN flow and sends a native image item', asyn
   const sent = JSON.parse(calls[2].init.body).msg;
   assert.equal(sent.context_token, 'message-context');
   assert.equal(sent.run_id, 'run-image');
-  assert.match(sent.client_id, /^dsh-weixin-[0-9a-f]{32}$/);
+  assert.match(sent.client_id, /^openclaw-weixin:\d{13}-[0-9a-f]{8}$/);
   assert.equal(result.messageId, sent.client_id);
   assert.deepEqual(sent.item_list, [{
     type: 2,
@@ -550,6 +551,54 @@ test('getUpdates converts its own long-poll timeout into an empty successful pol
   assert.deepEqual(result, { ret: 0, msgs: [], get_updates_buf: 'cursor' });
 });
 
+test('getConfig and sendTyping use the iLink typing handshake envelope', async () => {
+  const calls = [];
+  const api = createWeixinApi({
+    fetchImpl: async (url, init) => {
+      calls.push({ url: url.toString(), init, body: JSON.parse(init.body) });
+      return jsonResponse({ ret: 0, typing_ticket: 'ticket-value' });
+    },
+  });
+  const config = await api.getConfig({
+    baseUrl: 'https://ilinkai.weixin.qq.com', token: 'secret-token',
+    ilinkUserId: 'owner-user', contextToken: 'context-value',
+  });
+  await api.sendTyping({
+    baseUrl: 'https://ilinkai.weixin.qq.com', token: 'secret-token',
+    ilinkUserId: 'owner-user', typingTicket: config.typing_ticket, status: 1,
+  });
+  assert.equal(calls[0].url, 'https://ilinkai.weixin.qq.com/ilink/bot/getconfig');
+  assert.deepEqual(calls[0].body, {
+    ilink_user_id: 'owner-user', context_token: 'context-value',
+    base_info: { channel_version: '2.4.6', bot_agent: 'DeepSeekHarness/1.1.0' },
+  });
+  assert.equal(calls[1].url, 'https://ilinkai.weixin.qq.com/ilink/bot/sendtyping');
+  assert.deepEqual(calls[1].body.msg, undefined);
+  assert.deepEqual(calls[1].body, {
+    ilink_user_id: 'owner-user', typing_ticket: 'ticket-value', status: 1,
+    base_info: { channel_version: '2.4.6', bot_agent: 'DeepSeekHarness/1.1.0' },
+  });
+  assert.doesNotMatch(JSON.stringify(calls[0].body), /secret-token/);
+});
+
+test('sendText, getConfig, and sendTyping reject both ret and errcode', async () => {
+  for (const response of [{ ret: -2 }, { errcode: -14 }]) {
+    const api = createWeixinApi({ fetchImpl: async () => jsonResponse(response) });
+    await assert.rejects(
+      api.sendText({ baseUrl: 'https://ilinkai.weixin.qq.com', token: 'token', toUserId: 'u', text: 'x' }),
+      (error) => error instanceof WeixinApiError && error.code === 'send-rejected',
+    );
+    await assert.rejects(
+      api.getConfig({ baseUrl: 'https://ilinkai.weixin.qq.com', token: 'token', ilinkUserId: 'u' }),
+      (error) => error instanceof WeixinApiError && error.code === 'config-rejected',
+    );
+    await assert.rejects(
+      api.sendTyping({ baseUrl: 'https://ilinkai.weixin.qq.com', token: 'token', ilinkUserId: 'u', typingTicket: 't', status: 2 }),
+      (error) => error instanceof WeixinApiError && error.code === 'typing-rejected',
+    );
+  }
+});
+
 test('Weixin URL, inbound text, and reply chunk helpers enforce their narrow formats', () => {
   assert.equal(
     normalizeWeixinApiBaseUrl('https://ilinkai.weixin.qq.com/path'),
@@ -559,4 +608,9 @@ test('Weixin URL, inbound text, and reply chunk helpers enforce their narrow for
   assert.equal(extractWeixinText({ item_list: [{ type: 1, text_item: { text: ' 你好 ' } }] }), '你好');
   assert.equal(extractWeixinText({ item_list: [{ type: 3, voice_item: { text: '语音转写' } }] }), '语音转写');
   assert.deepEqual(splitWeixinText('abcdefgh', 5), ['abcde', 'fgh']);
+  assert.deepEqual(splitWeixinText('先接住你。\n再问一句。', 30), ['先接住你。', '再问一句。']);
+  assert.deepEqual(
+    splitWeixinText('那就先搞钱咯，约会也得有经费嘛。你想找个来钱快的，还是慢慢做大的？', 24),
+    ['那就先搞钱咯，约会也得有经费嘛。', '你想找个来钱快的，还是慢慢做大的？'],
+  );
 });

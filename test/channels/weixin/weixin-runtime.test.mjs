@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { WeixinApiError } from '../../../src/channels/weixin/weixin-api.mjs';
 import { WeixinRuntime } from '../../../src/channels/weixin/weixin-runtime.mjs';
+import { createDshImGateway } from '../../../src/channels/shared/dsh-im-gateway.mjs';
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -78,6 +79,135 @@ test('runtime sends a connection test to the bound Weixin owner without reply co
   assert.equal(sends[0].text, '连接测试');
   assert.equal(sends[0].contextToken, undefined);
   assert.equal(sends[0].runId, undefined);
+  await runtime.stop();
+});
+
+test('runtime records only deduplicated owner inbound in the optional gateway and revokes it on stop', async () => {
+  const { gateway, registry } = createDshImGateway();
+  const stateData = { seen: new Set() };
+  let polled = false;
+  const api = {
+    notifyStart: async () => {}, notifyStop: async () => {}, sendText: async () => {},
+    getUpdates: async ({ signal }) => {
+      if (!polled) {
+        polled = true;
+        return { ret: 0, msgs: [
+          { message_id: 10, message_type: 2, from_user_id: 'owner' },
+          { message_id: 11, message_type: 1, from_user_id: 'other', item_list: [{ type: 1, text_item: { text: '/help' } }] },
+          { message_id: 12, message_type: 1, from_user_id: 'owner', item_list: [{ type: 1, text_item: { text: '/help' } }] },
+          { message_id: 12, message_type: 1, from_user_id: 'owner', item_list: [{ type: 1, text_item: { text: '/help' } }] },
+          { message_id: 13, message_type: 1, from_user_id: 'owner', item_list: [{ type: 1, text_item: { text: '/help' } }] },
+        ] };
+      }
+      return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true }));
+    },
+  };
+  const runtime = new WeixinRuntime({ api, config: { botId: 'wx_gateway', baseUrl: 'https://ilinkai.weixin.qq.com/', ownerUserId: 'owner' }, token: 'token',
+    harness: { ensureRunning: async () => true }, state: {
+      getUpdatesBuf: () => '', hasSeen: (id) => stateData.seen.has(String(id)), markSeen: async (id) => stateData.seen.add(String(id)),
+    }, dshImGatewayRegistry: registry, logger: { error() {}, warn() {} } });
+  await runtime.start();
+  await eventually(() => gateway.listRoutes().length === 1 && gateway.readInboundSince(null, 10).events.length === 2, 'owner inbound was not recorded');
+  const route = gateway.listRoutes()[0];
+  assert.equal(route.routeVersion, 1);
+  assert.equal(gateway.readInboundSince(null, 10).events.some((event) => event.messageId === '10'), false);
+  await runtime.stop();
+  assert.equal(gateway.getRoute(route.routeId).status, 'revoked');
+  await assert.rejects(() => gateway.send(route.routeId, { kind: 'text', text: 'after stop' }, { idempotencyKey: 'stop-key' }), (error) => error.code === 'inactive_route');
+});
+
+test('gateway reply-adjacent text and image delivery reuse the latest inbound context', async () => {
+  const { gateway, registry } = createDshImGateway();
+  const textSends = [];
+  const imageSends = [];
+  let deliveredInbound = false;
+  const state = { seen: new Set(), getUpdatesBuf: () => '', hasSeen: (id) => state.seen.has(String(id)), markSeen: async (id) => state.seen.add(String(id)) };
+  const api = {
+    notifyStart: async () => {}, notifyStop: async () => {},
+    sendText: async (request) => { textSends.push(request); return { message_id: 'text-provider-id' }; },
+    sendImage: async (request) => { imageSends.push(request); return { message_id: 'image-provider-id' }; },
+    getUpdates: async ({ signal }) => {
+      if (!deliveredInbound) { deliveredInbound = true; return { ret: 0, msgs: [{ message_id: 1, message_type: 1, from_user_id: 'owner', context_token: 'latest-context', run_id: 'latest-run', item_list: [{ type: 1, text_item: { text: '/help' } }] }] }; }
+      return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true }));
+    },
+  };
+  const runtime = new WeixinRuntime({ api, config: { botId: 'wx_send', baseUrl: 'https://ilinkai.weixin.qq.com/', ownerUserId: 'owner' }, token: 'token', harness: { ensureRunning: async () => true }, state, dshImGatewayRegistry: registry, logger: { error() {}, warn() {} } });
+  await runtime.start();
+  await eventually(() => gateway.listRoutes().length === 1, 'gateway route was not created');
+  const route = gateway.listRoutes()[0];
+  const textReceipt = await gateway.send(route.routeId, { kind: 'text', text: '主动消息' }, { idempotencyKey: ' text-key ' });
+  assert.equal(textReceipt.schemaVersion, 1);
+  assert.equal(textReceipt.deliveryId, ' text-key ');
+  assert.equal(textReceipt.presentation, 'weixin-proactive-text');
+  assert.equal(textReceipt.deliveryOutcome, 'sent');
+  assert.deepEqual(textReceipt.providerMessageIds, ['text-provider-id']);
+  assert.equal(textSends.at(-1).toUserId, 'owner');
+  assert.equal(textSends.at(-1).contextToken, 'latest-context');
+  assert.equal(textSends.at(-1).runId, 'latest-run');
+  const imageReceipt = await gateway.send(route.routeId, { kind: 'sticker', stickerId: 'sticker-1', file: { fileName: 'sticker.png', bytes: Buffer.from('png'), mediaType: 'image/png' } }, { idempotencyKey: 'image-key' });
+  assert.equal(imageReceipt.schemaVersion, 1);
+  assert.equal(imageReceipt.presentation, 'weixin-proactive-image');
+  assert.equal(imageReceipt.deliveryOutcome, 'sent');
+  assert.deepEqual(imageReceipt.providerMessageIds, ['image-provider-id']);
+  assert.deepEqual(imageReceipt.artifacts, [{ artifactId: 'sticker-1', outcome: 'sent' }]);
+  assert.equal(imageSends.at(-1).toUserId, 'owner');
+  assert.equal(imageSends.at(-1).file.deliveryKey, 'image-key');
+  assert.equal(Buffer.isBuffer(imageSends.at(-1).file.bytes), true);
+  assert.equal(imageSends.at(-1).contextToken, 'latest-context');
+  assert.equal(imageSends.at(-1).runId, 'latest-run');
+  await assert.rejects(
+    () => gateway.send(route.routeId, { kind: 'image', file: { fileName: 'bad.png', bytes: 'not-bytes' } }, { idempotencyKey: 'bad-bytes' }),
+    /Unsupported proactive Weixin message/,
+  );
+  await runtime.stop();
+});
+
+test('gateway proactive unknown receipts do not retry text network failures or image uncertain failures', async () => {
+  const { gateway, registry } = createDshImGateway();
+  let textCalls = 0;
+  let imageCalls = 0;
+  let inbound = false;
+  const state = { seen: new Set(), getUpdatesBuf: () => '', hasSeen: (id) => state.seen.has(String(id)), markSeen: async (id) => state.seen.add(String(id)) };
+  const api = {
+    notifyStart: async () => {}, notifyStop: async () => {},
+    sendText: async () => { textCalls += 1; if (textCalls === 1) return { message_id: 'inbound-reply' }; throw new WeixinApiError('network-error', 'offline'); },
+    sendImage: async () => { imageCalls += 1; throw new WeixinApiError('artifact-delivery-uncertain', 'unknown'); },
+    getUpdates: async ({ signal }) => {
+      if (!inbound) { inbound = true; return { ret: 0, msgs: [{ message_id: 2, message_type: 1, from_user_id: 'owner', item_list: [{ type: 1, text_item: { text: '/help' } }] }] }; }
+      return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true }));
+    },
+  };
+  const runtime = new WeixinRuntime({ api, config: { botId: 'wx_unknown', baseUrl: 'https://ilinkai.weixin.qq.com/', ownerUserId: 'owner' }, token: 'token', harness: { ensureRunning: async () => true }, state, dshImGatewayRegistry: registry, logger: { error() {}, warn() {} } });
+  await runtime.start();
+  await eventually(() => gateway.listRoutes().length === 1, 'gateway route was not created');
+  const route = gateway.listRoutes()[0];
+  const textReceipt = await gateway.send(route.routeId, { kind: 'text', text: 'x' }, { idempotencyKey: 'unknown-text' });
+  assert.equal(textReceipt.deliveryOutcome, 'unknown');
+  assert.equal(textCalls, 2);
+  const imageReceipt = await gateway.send(route.routeId, { kind: 'image', file: { fileName: 'x.png', bytes: Uint8Array.from([1]) } }, { idempotencyKey: 'unknown-image' });
+  assert.equal(imageReceipt.deliveryOutcome, 'unknown');
+  assert.equal(imageCalls, 1);
+  await runtime.stop();
+});
+
+test('monitor failure revokes the active gateway route immediately', async () => {
+  const { gateway, registry } = createDshImGateway();
+  let pollCount = 0;
+  const state = { seen: new Set(), getUpdatesBuf: () => '', hasSeen: (id) => state.seen.has(String(id)), markSeen: async (id) => state.seen.add(String(id)) };
+  const api = {
+    notifyStart: async () => {}, notifyStop: async () => {}, sendText: async () => ({ message_id: 'reply' }),
+    getUpdates: async ({ signal }) => {
+      pollCount += 1;
+      if (pollCount === 1) return { ret: 0, msgs: [{ message_id: 3, message_type: 1, from_user_id: 'owner', item_list: [{ type: 1, text_item: { text: '/help' } }] }] };
+      throw new WeixinApiError('stale-token', 'stale');
+    },
+  };
+  const runtime = new WeixinRuntime({ api, config: { botId: 'wx_monitor_failure', baseUrl: 'https://ilinkai.weixin.qq.com/', ownerUserId: 'owner' }, token: 'token', harness: { ensureRunning: async () => true }, state, dshImGatewayRegistry: registry, logger: { error() {}, warn() {} } });
+  await runtime.start();
+  await eventually(() => gateway.listRoutes().length === 1, 'gateway route was not created');
+  const routeId = gateway.listRoutes()[0].routeId;
+  await eventually(() => runtime.status.ready === false && gateway.getRoute(routeId).status === 'revoked', 'monitor failure did not revoke route');
+  await assert.rejects(() => gateway.send(routeId, { kind: 'text', text: 'x' }, { idempotencyKey: 'monitor-key' }), (error) => error.code === 'inactive_route');
   await runtime.stop();
 });
 

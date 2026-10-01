@@ -3,10 +3,10 @@ import {
   createDecipheriv,
   createHash,
   randomBytes,
-  randomUUID,
 } from 'node:crypto';
 
 import { fetchImageBuffer } from '../shared/image-prompt.mjs';
+import { splitChatText } from '../shared/chat-text.mjs';
 
 export const WEIXIN_QR_BASE_URL = 'https://ilinkai.weixin.qq.com/';
 export const WEIXIN_PROTOCOL_VERSION = '2.4.6';
@@ -97,6 +97,14 @@ function rejectedProviderResponse(value) {
     }
   }
   return null;
+}
+
+function assertProviderAccepted(value, code, message) {
+  const rejection = rejectedProviderResponse(value);
+  if (rejection) {
+    throw new WeixinApiError(code, message, { providerCode: rejection });
+  }
+  return value;
 }
 
 function classifyWeixinFinalDeliveryError(error, signal) {
@@ -299,6 +307,12 @@ function baseInfo() {
     channel_version: WEIXIN_PROTOCOL_VERSION,
     bot_agent: 'DeepSeekHarness/1.1.0',
   };
+}
+
+// Keep the client id identical in shape to Tencent's reference implementation.
+// The iLink API can acknowledge malformed ids before downstream delivery.
+function weixinClientId() {
+  return `openclaw-weixin:${Date.now()}-${randomBytes(4).toString('hex')}`;
 }
 
 function aesEcbPaddedSize(size) {
@@ -526,13 +540,7 @@ export function createWeixinApi({ fetchImpl = fetch } = {}) {
       throw weixinArtifactError(error, { fallback });
     }
     signal?.throwIfAborted();
-    const deliverySeed = nonEmptyString(file.deliveryKey) ?? nonEmptyString(file.artifactId)
-      ?? randomUUID();
-    const clientIdSeed = mediaType === 3 ? deliverySeed : `${deliverySeed}\u0000${mediaType}`;
-    const clientId = `dsh-weixin-${createHash('sha256')
-      .update(clientIdSeed)
-      .digest('hex')
-      .slice(0, 32)}`;
+    const clientId = weixinClientId();
     const media = {
       encrypt_query_param: downloadParam,
       aes_key: Buffer.from(aesKey.toString('hex')).toString('base64'),
@@ -650,7 +658,7 @@ export function createWeixinApi({ fetchImpl = fetch } = {}) {
           msg: {
             from_user_id: '',
             to_user_id: recipient,
-            client_id: `dsh-weixin-${randomUUID()}`,
+            client_id: weixinClientId(),
             message_type: 2,
             message_state: 2,
             item_list: [{ type: 1, text_item: { text: content } }],
@@ -660,10 +668,49 @@ export function createWeixinApi({ fetchImpl = fetch } = {}) {
           base_info: baseInfo(),
         },
       });
-      if (response?.ret !== undefined && response.ret !== 0) {
-        throw new WeixinApiError('send-rejected', '微信服务拒绝了回复消息。');
-      }
-      return true;
+      assertProviderAccepted(response, 'send-rejected', '微信服务拒绝了回复消息。');
+      return { messageId: response?.message_id, ...response };
+    },
+
+    async getConfig({ baseUrl, token, ilinkUserId, contextToken, signal }) {
+      const userId = nonEmptyString(ilinkUserId);
+      if (!userId) throw new TypeError('ilinkUserId is required');
+      const response = await requestJson(fetchImpl, {
+        method: 'POST',
+        baseUrl,
+        endpoint: 'ilink/bot/getconfig',
+        token,
+        signal,
+        timeoutMs: 10_000,
+        body: {
+          ilink_user_id: userId,
+          ...(nonEmptyString(contextToken) ? { context_token: contextToken.trim() } : {}),
+          base_info: baseInfo(),
+        },
+      });
+      return assertProviderAccepted(response, 'config-rejected', '微信服务拒绝了会话配置请求。');
+    },
+
+    async sendTyping({ baseUrl, token, ilinkUserId, typingTicket, status, signal }) {
+      const userId = nonEmptyString(ilinkUserId);
+      const ticket = nonEmptyString(typingTicket);
+      if (!userId || !ticket) throw new TypeError('ilinkUserId and typingTicket are required');
+      if (status !== 1 && status !== 2) throw new TypeError('status must be 1 or 2');
+      const response = await requestJson(fetchImpl, {
+        method: 'POST',
+        baseUrl,
+        endpoint: 'ilink/bot/sendtyping',
+        token,
+        signal,
+        timeoutMs: 10_000,
+        body: {
+          ilink_user_id: userId,
+          typing_ticket: ticket,
+          status,
+          base_info: baseInfo(),
+        },
+      });
+      return assertProviderAccepted(response, 'typing-rejected', '微信服务拒绝了输入状态请求。');
     },
 
     async sendFile(request) {
@@ -745,15 +792,5 @@ export function weixinMessageId(message) {
 }
 
 export function splitWeixinText(text, maxChars = 4_000) {
-  if (text.length <= maxChars) return [text];
-  const chunks = [];
-  let remaining = text;
-  while (remaining.length > maxChars) {
-    let splitAt = remaining.lastIndexOf('\n', maxChars);
-    if (splitAt < Math.floor(maxChars * 0.6)) splitAt = maxChars;
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).replace(/^\n+/, '');
-  }
-  if (remaining) chunks.push(remaining);
-  return chunks;
+  return splitChatText(text, maxChars);
 }

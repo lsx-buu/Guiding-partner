@@ -1,0 +1,39 @@
+# Merge these rows into %USERPROFILE%/.dsh/profiles/web/cordis.patch.yml.
+# Replace C:/Users/YOU with your own absolute user directory.
+- id: xmanrui-dsh-im
+  config:
+    companionHarness:
+      workspace: 'C:/Users/YOU/.dsh/workspaces/companion-internal'
+      agentPreset: companion
+    weixin:
+      workspace: 'C:/Users/YOU/.dsh/workspaces/companion-chat'
+      agentPreset: companion
+      maxMessageChars: 36
+    qq:
+      workspace: 'C:/Users/YOU/.dsh/workspaces/companion-chat'
+      agentPreset: companion
+      maxMessageChars: 36
+
+- id: dsh-companion
+  config:
+    preset:
+      enabled: true
+    worker:
+      enabled: true
+      intervalMs: 60000
+    systemPrompt:
+      enabled: false
+    stickers:
+      enabled: true
+      rootDir: 'C:/Users/YOU/.dsh/integrations/dsh-companion/stickers'
+      manifestPath: 'C:/Users/YOU/.dsh/integrations/dsh-companion/stickers/stickers.json'
+      autoImport: true
+      cooldownMs: 86400000
+      capture:
+        enabled: true
+      reply:
+        enabled: true
+        probability: 0.35
+        forceAfterEligibleMisses: 3
+        minIntervalMs: 1800000
+        delayMs: 450

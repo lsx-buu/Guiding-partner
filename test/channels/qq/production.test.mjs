@@ -10,6 +10,7 @@ test('QQ production has no per-bot result-file Gate', async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), 'dsh-qq-production-artifacts-'));
   t.after(() => rm(dataDir, { recursive: true, force: true }));
   const runtimes = [];
+  const dshImGatewayRegistry = { registerAdapter() {} };
   let controllerOptions;
 
   class ConfigStore {
@@ -45,7 +46,7 @@ test('QQ production has no per-bot result-file Gate', async (t) => {
     credentials: {},
     webServer: { port: 3080 },
     logger: () => ({ error() {}, warn() {}, info() {}, debug() {} }),
-  }, { dataDir }, {
+  }, { dataDir, dshImGatewayRegistry }, {
     ConfigStore,
     StateStore,
     HarnessClient: Harness,
@@ -68,5 +69,7 @@ test('QQ production has no per-bot result-file Gate', async (t) => {
 
   assert.equal(Object.hasOwn(runtimes[0], 'outboundArtifactsEnabled'), false);
   assert.equal(Object.hasOwn(runtimes[1], 'outboundArtifactsEnabled'), false);
+  assert.equal(runtimes[0].dshImGatewayRegistry, dshImGatewayRegistry);
+  assert.equal(runtimes[1].dshImGatewayRegistry, dshImGatewayRegistry);
   await production.close();
 });

@@ -121,3 +121,23 @@ test('Host reports aggregate failure only after every channel was attempted', as
   assert.deepEqual(fixture.calls, CHANNELS.map(([channel]) => channel));
   assert.equal(fixture.errors.length, CHANNELS.length);
 });
+
+test('Host provides a dedicated Harness client for companion generation and web search', async () => {
+  const provided = new Map();
+  let harnessOptions;
+  class CompanionHarnessClient {
+    constructor(options) { harnessOptions = options; }
+  }
+  const noops = Object.fromEntries(CHANNELS.map(([, applyName]) => [applyName, async () => {}]));
+  const plugin = createImHostPlugin({ ...noops, CompanionHarnessClient });
+  await plugin.apply({
+    webServer: { port: 3210 },
+    provide: (name, service) => provided.set(name, service),
+  }, { companionHarness: { workspace: 'C:\\companion-workspace', agentPreset: 'companion' } });
+  assert.ok(provided.has('dshImGateway'));
+  assert.ok(provided.get('dshCompanionHarness') instanceof CompanionHarnessClient);
+  assert.equal(harnessOptions.baseUrl, 'http://127.0.0.1:3210');
+  assert.equal(harnessOptions.workspace, 'C:\\companion-workspace');
+  assert.equal(harnessOptions.agentPreset, 'companion');
+  assert.equal(harnessOptions.autostart, false);
+});

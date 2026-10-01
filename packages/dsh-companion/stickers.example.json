@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "stickers": [
+    {
+      "id": "example-wave",
+      "file": "assets/example-wave.png",
+      "emotion": "happy",
+      "intensity": 1,
+      "tags": ["greeting"],
+      "contexts": ["morning"]
+    }
+  ]
+}

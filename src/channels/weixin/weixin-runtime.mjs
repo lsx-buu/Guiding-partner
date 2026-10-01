@@ -5,6 +5,7 @@ import {
   connectionTestTargetUnavailable,
 } from '../shared/connection-test.mjs';
 import { t } from '../shared/i18n.mjs';
+import { createDeliveryReceipt, providerMessageIdsFor } from '../shared/semantic/delivery.mjs';
 
 const DEFAULT_START_RETRY_DELAYS_MS = Object.freeze([250, 1_000, 3_000]);
 const HARNESS_HEALTH_ERROR_CODES = new Set([
@@ -100,6 +101,9 @@ export class WeixinRuntime {
   #abortController = null;
   #monitor = null;
   #starting = null;
+  #gatewayRegistry;
+  #adapterId;
+  #adapterUnregister = null;
 
   constructor({
     api,
@@ -111,6 +115,7 @@ export class WeixinRuntime {
     replyTimeoutMs = 600_000,
     maxMessageChars = 4_000,
     startRetryDelaysMs,
+    dshImGatewayRegistry,
   }) {
     if (!api || !config || !token || !harness || !state) {
       throw new TypeError('WeixinRuntime requires API, account, token, Harness, and state');
@@ -124,6 +129,8 @@ export class WeixinRuntime {
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#maxMessageChars = maxMessageChars;
     this.#startRetryDelaysMs = startRetryDelays(startRetryDelaysMs);
+    this.#gatewayRegistry = dshImGatewayRegistry;
+    this.#adapterId = `weixin:${this.#config.botId}`;
   }
 
   get status() {
@@ -166,12 +173,23 @@ export class WeixinRuntime {
         replyTimeoutMs: this.#replyTimeoutMs,
         maxMessageChars: this.#maxMessageChars,
         signal,
+        dshImGatewayRegistry: this.#gatewayRegistry,
+        botId: this.#config.botId,
       });
+      if (this.#gatewayRegistry) {
+        this.#adapterUnregister = this.#gatewayRegistry.registerAdapter(this.#adapterId, {
+          capabilities: { text: true, image: true, idempotency: 'local-at-most-once' },
+          getHealth: () => ({ status: this.#status.ready ? 'online' : 'offline' }),
+          send: (route, message, options) => this.#sendProactive(route, message, options),
+        });
+      }
       this.#status.ready = true;
       this.#status.weixinConnectionState = 'connected';
       this.#status.lastCheckedAt = Date.now();
       this.#monitor = this.#runMonitor(signal).catch((error) => {
         if (signal.aborted) return;
+        this.#adapterUnregister?.();
+        this.#adapterUnregister = null;
         this.#status.ready = false;
         this.#status.weixinConnectionState = 'failed';
         this.#status.lastError = error?.message ?? String(error);
@@ -182,6 +200,8 @@ export class WeixinRuntime {
       this.#abortController?.abort();
       this.#abortController = null;
       this.#bridge = null;
+      this.#adapterUnregister?.();
+      this.#adapterUnregister = null;
       this.#status.ready = false;
       this.#status.weixinConnectionState = 'failed';
       this.#status.lastError = error?.message ?? String(error);
@@ -270,6 +290,8 @@ export class WeixinRuntime {
     this.#monitor = null;
     await monitor?.catch(() => undefined);
     await bridge?.waitForIdle();
+    this.#adapterUnregister?.();
+    this.#adapterUnregister = null;
     this.#bridge = null;
     if (wasStarted) {
       try {
@@ -287,6 +309,76 @@ export class WeixinRuntime {
     return this.status;
   }
 
+  async #sendProactive(route, message, options = {}) {
+    if (!this.#status.ready || !this.#abortController) throw new Error('Weixin runtime is not connected');
+    const currentRouteId = this.#bridge?.gatewayRouteId;
+    if (!route || route.channel !== 'weixin' || route.kind !== 'direct'
+      || route.botId !== this.#config.botId || route.conversationId !== this.#config.ownerUserId
+      || route.ownerId !== this.#config.ownerUserId || route.routeId !== currentRouteId) {
+      throw new Error('Weixin proactive route is not trusted');
+    }
+    const key = options.idempotencyKey;
+    if (typeof key !== 'string' || !key.trim()) throw new TypeError('idempotencyKey must be a non-empty string');
+    const replyContext = this.#bridge?.outboundContextFor(this.#config.ownerUserId);
+    try {
+      if (message?.kind === 'text' && typeof message.text === 'string' && message.text.trim()) {
+        const result = await this.#api.sendText({
+          baseUrl: this.#config.baseUrl,
+          token: this.#token,
+          toUserId: this.#config.ownerUserId,
+          text: message.text,
+          contextToken: replyContext?.contextToken,
+          runId: replyContext?.runId,
+          signal: this.#abortController.signal,
+        });
+        return createDeliveryReceipt({
+          deliveryId: key,
+          presentation: 'weixin-proactive-text',
+          providerMessageIds: providerMessageIdsFor(result),
+          deliveryOutcome: 'sent',
+        });
+      }
+      if ((message?.kind === 'image' || message?.kind === 'sticker')
+        && message.file && typeof message.file.fileName === 'string' && message.file.fileName.trim()
+        && (Buffer.isBuffer(message.file.bytes) || message.file.bytes instanceof Uint8Array)) {
+        const bytes = Buffer.from(message.file.bytes);
+        if (bytes.byteLength === 0) throw new TypeError('proactive image file bytes must be non-empty');
+        const result = await this.#api.sendImage({
+          baseUrl: this.#config.baseUrl,
+          token: this.#token,
+          toUserId: this.#config.ownerUserId,
+          file: { ...message.file, fileName: message.file.fileName.trim(), bytes, deliveryKey: key },
+          contextToken: replyContext?.contextToken,
+          runId: replyContext?.runId,
+          signal: this.#abortController.signal,
+        });
+        return createDeliveryReceipt({
+          deliveryId: key,
+          presentation: 'weixin-proactive-image',
+          providerMessageIds: providerMessageIdsFor(result),
+          deliveryOutcome: 'sent',
+          artifacts: [{ artifactId: message.stickerId ?? message.file.fileName ?? key, outcome: 'sent' }],
+        });
+      }
+      throw new TypeError('Unsupported proactive Weixin message');
+    } catch (error) {
+      if (error?.name === 'AbortError' || error?.code === 'ABORT_ERR') throw error;
+      const uncertain = error?.code === 'artifact-delivery-uncertain'
+        || ['network-error', 'timeout', 'invalid-response'].includes(error?.code)
+        || (error?.code === 'http-error' && (error.status === 408 || error.status === 425 || error.status >= 500));
+      if (uncertain) {
+        return createDeliveryReceipt({
+          deliveryId: key,
+          presentation: message?.kind === 'text' ? 'weixin-proactive-text' : 'weixin-proactive-image',
+          deliveryOutcome: 'unknown',
+          reason: error.code,
+          artifacts: message?.kind === 'text' ? [] : [{ artifactId: message?.stickerId ?? message?.file?.fileName ?? key, outcome: 'unknown', reason: error.code }],
+        });
+      }
+      throw error;
+    }
+  }
+
   async sendConnectionTest(text) {
     const remembered = connectionTestTarget(this.#state);
     const toUserId = typeof remembered?.toUserId === 'string' && remembered.toUserId.trim()
@@ -298,11 +390,14 @@ export class WeixinRuntime {
     if (!this.#status.ready || !this.#abortController) {
       throw new Error('Weixin runtime is not connected');
     }
+    const replyContext = this.#bridge?.outboundContextFor(toUserId);
     await this.#api.sendText({
       baseUrl: this.#config.baseUrl,
       token: this.#token,
       toUserId,
       text,
+      contextToken: replyContext?.contextToken,
+      runId: replyContext?.runId,
       signal: this.#abortController.signal,
     });
     return { sent: true };

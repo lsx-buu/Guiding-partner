@@ -109,6 +109,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         harness: workspaceScope.harness,
         state: workspaceScope.state,
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
+        maxMessageChars: config.maxMessageChars ?? 4_000,
         connectTimeoutMs: config.connectTimeoutMs ?? 20_000,
         logger: {
           error: (...args) => logger.error?.(`[${botId}]`, ...args),
@@ -116,6 +117,7 @@ export async function createProductionController(ctx, config = {}, internals = {
           info: (...args) => logger.info?.(`[${botId}]`, ...args),
           debug: (...args) => logger.debug?.(`[${botId}]`, ...args),
         },
+        dshImGatewayRegistry: config.dshImGatewayRegistry,
       });
     },
     deleteState: async ({ botId }) => {

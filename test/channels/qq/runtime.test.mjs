@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { QqRuntime } from '../../../src/channels/qq/qq-runtime.mjs';
 import { rememberConnectionTestTarget } from '../../../src/channels/shared/connection-test.mjs';
+import { createDshImGateway } from '../../../src/channels/shared/dsh-im-gateway.mjs';
 
 function deferred() {
   let resolve;
@@ -14,6 +15,7 @@ function deferred() {
 class FakeBot extends EventEmitter {
   middlewares = [];
   sent = [];
+  images = [];
   stopped = false;
   use(value) { this.middlewares.push(value); }
   async start(signal) {
@@ -22,6 +24,20 @@ class FakeBot extends EventEmitter {
   }
   stop() { this.stopped = true; }
   async sendText(target, text) { this.sent.push({ target, text }); }
+  async sendImage(target, source) {
+    this.images.push({ target, bytes: Buffer.from(source.buffer) });
+    return { message: { id: `image-${this.images.length}` } };
+  }
+}
+
+function gatewayState() {
+  return {
+    hasSeen: () => false,
+    markSeen: async () => {},
+    sessionFor: () => null,
+    setSession: async () => {},
+    clearSession: async () => {},
+  };
 }
 
 test('QQ runtime waits for gateway ready, installs typing, and stops its client', async () => {
@@ -126,6 +142,75 @@ test('QQ runtime requires a remembered private target for wildcard owners and st
     target: { scope: 'c2c', targetId: 'recent-user' },
     text: 'remembered-target',
   }]);
+  await runtime.stop();
+});
+
+test('QQ gateway routes proactive text and stickers only to the explicit trusted owner', async () => {
+  const bot = new FakeBot();
+  const { gateway, registry } = createDshImGateway();
+  const runtime = new QqRuntime({
+    config: { botId: 'qq_gateway', appId: 'app', ownerUserOpenid: 'trusted-owner' },
+    appSecret: 'secret',
+    harness: { ensureRunning: async () => true },
+    state: gatewayState(),
+    createBot: () => bot,
+    typingMiddleware: () => 'typing',
+    connectTimeoutMs: 100,
+    dshImGatewayRegistry: registry,
+  });
+
+  await runtime.start();
+  bot.emit('message', {}, {
+    kind: 'c2c',
+    rawEventType: 'C2C_MESSAGE_CREATE',
+    senderId: 'trusted-owner',
+    senderIsBot: false,
+    content: '/help',
+    messageId: 'owner-inbound',
+    replyTarget: { scope: 'c2c', targetId: 'trusted-owner', msgId: 'owner-inbound' },
+  });
+  const route = gateway.listRoutes()[0];
+  assert.equal(route.ownerId, 'trusted-owner');
+  assert.equal(route.inboundVersion, 1);
+
+  const textReceipt = await gateway.send(route.routeId, { kind: 'text', text: '主动问候' }, {
+    idempotencyKey: 'qq-text-1',
+  });
+  const stickerReceipt = await gateway.send(route.routeId, {
+    kind: 'sticker',
+    stickerId: 'hug',
+    file: { fileName: 'hug.png', bytes: Buffer.from('image') },
+  }, { idempotencyKey: 'qq-sticker-1' });
+  assert.equal(textReceipt.presentation, 'qq-proactive-text');
+  assert.equal(stickerReceipt.presentation, 'qq-proactive-image');
+  assert.deepEqual(bot.sent.find(({ text }) => text === '主动问候')?.target, {
+    scope: 'c2c', targetId: 'trusted-owner',
+  });
+  assert.deepEqual(bot.images[0].target, { scope: 'c2c', targetId: 'trusted-owner' });
+  await runtime.stop();
+  assert.equal(gateway.getRoute(route.routeId).status, 'revoked');
+});
+
+test('QQ wildcard owner never creates a proactive gateway route', async () => {
+  const bot = new FakeBot();
+  const { gateway, registry } = createDshImGateway();
+  const runtime = new QqRuntime({
+    config: { botId: 'qq_wildcard_gateway', appId: 'app', ownerUserOpenid: '*' },
+    appSecret: 'secret',
+    harness: { ensureRunning: async () => true },
+    state: gatewayState(),
+    createBot: () => bot,
+    typingMiddleware: () => 'typing',
+    connectTimeoutMs: 100,
+    dshImGatewayRegistry: registry,
+  });
+  await runtime.start();
+  bot.emit('message', {}, {
+    kind: 'c2c', rawEventType: 'C2C_MESSAGE_CREATE', senderId: 'someone', senderIsBot: false,
+    content: '/help', messageId: 'wildcard-inbound',
+    replyTarget: { scope: 'c2c', targetId: 'someone', msgId: 'wildcard-inbound' },
+  });
+  assert.deepEqual(gateway.listRoutes(), []);
   await runtime.stop();
 });
 

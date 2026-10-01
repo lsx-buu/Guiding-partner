@@ -5,6 +5,7 @@ import {
   connectionTestTargetUnavailable,
 } from '../shared/connection-test.mjs';
 import { t } from '../shared/i18n.mjs';
+import { createDeliveryReceipt, providerMessageIdsFor } from '../shared/semantic/delivery.mjs';
 import { createQqBridgeStatus, QqHarnessBridge } from './qq-bridge.mjs';
 
 function timeoutError() {
@@ -33,6 +34,7 @@ export class QqRuntime {
   #state;
   #logger;
   #replyTimeoutMs;
+  #maxMessageChars;
   #connectTimeoutMs;
   #createBot;
   #typingMiddleware;
@@ -42,6 +44,9 @@ export class QqRuntime {
   #abortController = null;
   #runTask = null;
   #starting = null;
+  #gatewayRegistry;
+  #adapterId;
+  #adapterUnregister = null;
 
   constructor({
     config,
@@ -50,9 +55,11 @@ export class QqRuntime {
     state,
     logger = console,
     replyTimeoutMs = 600_000,
+    maxMessageChars = 4_000,
     connectTimeoutMs = 20_000,
     createBot = (options) => new QQBot(options),
     typingMiddleware = typingIndicator,
+    dshImGatewayRegistry,
   }) {
     if (!config || !appSecret || !harness || !state) {
       throw new TypeError('QqRuntime requires config, app secret, Harness, and state');
@@ -63,9 +70,12 @@ export class QqRuntime {
     this.#state = state;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
+    this.#maxMessageChars = maxMessageChars;
     this.#connectTimeoutMs = connectTimeoutMs;
     this.#createBot = createBot;
     this.#typingMiddleware = typingMiddleware;
+    this.#gatewayRegistry = dshImGatewayRegistry;
+    this.#adapterId = `qq:${this.#config.botId}`;
   }
 
   get status() {
@@ -139,8 +149,23 @@ export class QqRuntime {
       status: this.#status,
       logger: this.#logger,
       replyTimeoutMs: this.#replyTimeoutMs,
+      maxMessageChars: this.#maxMessageChars,
       signal: controller.signal,
+      dshImGatewayRegistry: this.#gatewayRegistry,
+      botId: this.#config.botId,
     });
+    if (this.#gatewayRegistry) {
+      this.#adapterUnregister = this.#gatewayRegistry.registerAdapter(this.#adapterId, {
+        capabilities: {
+          text: true,
+          image: typeof bot.sendImage === 'function',
+          sticker: typeof bot.sendImage === 'function',
+          idempotency: 'local-at-most-once',
+        },
+        getHealth: () => ({ status: this.#status.ready ? 'online' : 'offline' }),
+        send: (route, message, options) => this.#sendProactive(route, message, options),
+      });
+    }
     bot.use?.(this.#typingMiddleware({
       keepAlive: true,
       predicate: (ctx) => this.#config.ownerUserOpenid === '*'
@@ -229,6 +254,8 @@ export class QqRuntime {
     this.#bot = null;
     this.#bridge = null;
     this.#runTask = null;
+    this.#adapterUnregister?.();
+    this.#adapterUnregister = null;
     try {
       bot?.stop();
     } catch (error) {
@@ -242,5 +269,77 @@ export class QqRuntime {
     this.#status.ready = false;
     this.#status.qqConnectionState = 'idle';
     return this.status;
+  }
+
+  async #sendProactive(route, message, options = {}) {
+    if (!this.#status.ready || !this.#bot || !this.#abortController) {
+      const error = new Error('QQ runtime is not connected');
+      error.code = 'adapter_unavailable';
+      throw error;
+    }
+    const ownerUserOpenid = typeof this.#config.ownerUserOpenid === 'string'
+      ? this.#config.ownerUserOpenid.trim()
+      : '';
+    if (!ownerUserOpenid || ownerUserOpenid === '*' || !route
+      || route.channel !== 'qq' || route.kind !== 'direct'
+      || route.botId !== this.#config.botId || route.conversationId !== ownerUserOpenid
+      || route.ownerId !== ownerUserOpenid || route.routeId !== this.#bridge?.gatewayRouteId) {
+      const error = new Error('QQ proactive route is not trusted');
+      error.code = 'inactive_route';
+      throw error;
+    }
+    const key = options.idempotencyKey;
+    if (typeof key !== 'string' || !key.trim()) {
+      throw new TypeError('idempotencyKey must be a non-empty string');
+    }
+    const target = { scope: 'c2c', targetId: ownerUserOpenid };
+    const presentation = message?.kind === 'text' ? 'qq-proactive-text' : 'qq-proactive-image';
+    try {
+      if (message?.kind === 'text' && typeof message.text === 'string' && message.text.trim()) {
+        const result = await this.#bot.sendText(target, message.text.trim());
+        return createDeliveryReceipt({
+          deliveryId: key,
+          presentation,
+          providerMessageIds: providerMessageIdsFor(result),
+          deliveryOutcome: 'sent',
+        });
+      }
+      if ((message?.kind === 'image' || message?.kind === 'sticker')
+        && message.file && typeof message.file.fileName === 'string' && message.file.fileName.trim()
+        && (Buffer.isBuffer(message.file.bytes) || message.file.bytes instanceof Uint8Array)
+        && typeof this.#bot.sendImage === 'function') {
+        const bytes = Buffer.from(message.file.bytes);
+        if (bytes.byteLength === 0) throw new TypeError('proactive image file bytes must be non-empty');
+        const result = await this.#bot.sendImage(
+          target,
+          { buffer: bytes },
+          { onProgress: () => this.#abortController?.signal.throwIfAborted() },
+        );
+        return createDeliveryReceipt({
+          deliveryId: key,
+          presentation,
+          providerMessageIds: providerMessageIdsFor(result),
+          deliveryOutcome: 'sent',
+          artifacts: [{ artifactId: message.stickerId ?? message.file.fileName, outcome: 'sent' }],
+        });
+      }
+      throw new TypeError('Unsupported proactive QQ message');
+    } catch (error) {
+      if (error?.name === 'AbortError' || error?.code === 'ABORT_ERR') throw error;
+      if (['artifact-delivery-uncertain', 'network-error', 'timeout', 'invalid-response'].includes(error?.code)) {
+        return createDeliveryReceipt({
+          deliveryId: key,
+          presentation,
+          deliveryOutcome: 'unknown',
+          reason: error.code,
+          artifacts: message?.kind === 'text' ? [] : [{
+            artifactId: message?.stickerId ?? message?.file?.fileName ?? key,
+            outcome: 'unknown',
+            reason: error.code,
+          }],
+        });
+      }
+      throw error;
+    }
   }
 }

@@ -41,6 +41,7 @@ import {
 } from '../shared/semantic/delivery.mjs';
 import { sendMarkdownReply } from './markdown-reply.mjs';
 import { t } from '../shared/i18n.mjs';
+import { cleanCompanionDraft, splitChatText } from '../shared/chat-text.mjs';
 
 function interactionResolvedText() {
   return t('这个问题已在其他客户端处理，无需再次回答。');
@@ -79,6 +80,8 @@ function helpText() {
     t('/stop  停止当前任务'),
     t('/steer 补充指令  纠偏当前任务'),
     t('/status  检查连接状态'),
+    t('/bqb  开始收集后续表情包'),
+    t('/bqb_end  结束收集表情包'),
     t('/help  显示本帮助'),
   ].join('\n');
 }
@@ -340,6 +343,7 @@ export class QqHarnessBridge {
   #status;
   #logger;
   #replyTimeoutMs;
+  #maxMessageChars;
   #signal;
   #fetchImpl;
   #fileUploadTimeoutMs;
@@ -350,6 +354,9 @@ export class QqHarnessBridge {
   #approvalTasks = new Set();
   #commandTasks = new Set();
   #approvals;
+  #dshImGatewayRegistry;
+  #botId;
+  #gatewayRouteId = null;
 
   constructor({
     bot,
@@ -359,9 +366,12 @@ export class QqHarnessBridge {
     status = createQqBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
+    maxMessageChars = 4_000,
     signal,
     fetchImpl = fetch,
     fileUploadTimeoutMs = DEFAULT_FILE_UPLOAD_TIMEOUT_MS,
+    dshImGatewayRegistry,
+    botId,
   }) {
     if (!bot || typeof bot.sendText !== 'function') throw new TypeError('QQ bot client is required');
     if (!ownerUserOpenid) throw new TypeError('QQ scanner identity is required');
@@ -377,9 +387,12 @@ export class QqHarnessBridge {
     this.#status = status;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
+    this.#maxMessageChars = maxMessageChars;
     this.#signal = signal;
     this.#fetchImpl = fetchImpl;
     this.#fileUploadTimeoutMs = Math.min(fileUploadTimeoutMs, DEFAULT_FILE_UPLOAD_TIMEOUT_MS);
+    this.#dshImGatewayRegistry = dshImGatewayRegistry;
+    this.#botId = botId;
     this.#approvals = new HarnessApprovalQueue({ label: 'qq', logger });
   }
 
@@ -388,6 +401,26 @@ export class QqHarnessBridge {
   }
 
   accept(message) {
+    if (this.#dshImGatewayRegistry?.dispatchInbound && message?.kind === 'c2c'
+      && this.#ownerUserOpenid !== '*' && nonEmptyString(message?.senderId) === this.#ownerUserOpenid) {
+      const messageId = nonEmptyString(message?.messageId);
+      if (messageId && !this.#state.hasSeen(messageId) && !this.#acceptedMessageIds.has(messageId)) {
+        this.#acceptedMessageIds.add(messageId);
+        this.#recordGatewayInbound(message, messageId);
+        const task = this.#dispatchGatewayInbound(message, messageId)
+          .then((handled) => {
+            if (handled) return undefined;
+            this.#acceptedMessageIds.delete(messageId);
+            return this.#acceptNormal(message, { skipGatewayRecord: true });
+          })
+          .finally(() => this.#acceptedMessageIds.delete(messageId));
+        return task;
+      }
+    }
+    return this.#acceptNormal(message);
+  }
+
+  #acceptNormal(message, { skipGatewayRecord = false } = {}) {
     if (this.#signal?.aborted) return Promise.resolve();
     const messageId = nonEmptyString(message?.messageId);
     const sender = nonEmptyString(message?.senderId);
@@ -397,6 +430,9 @@ export class QqHarnessBridge {
       || this.#acceptedMessageIds.has(messageId)) return Promise.resolve();
     const key = conversationKey(message);
     this.#acceptedMessageIds.add(messageId);
+    if (message.kind === 'c2c' && this.#ownerUserOpenid !== '*' && sender === this.#ownerUserOpenid) {
+      if (!skipGatewayRecord) this.#recordGatewayInbound(message, messageId);
+    }
     if (message.kind === 'c2c'
       && (this.#ownerUserOpenid === '*' || sender === this.#ownerUserOpenid)
       && message.replyTarget?.scope === 'c2c'
@@ -487,6 +523,66 @@ export class QqHarnessBridge {
       return current;
     }
     return this.#enqueueMessage(message, messageId, key);
+  }
+
+  async #dispatchGatewayInbound(message, messageId) {
+    const result = await this.#dshImGatewayRegistry.dispatchInbound(this.#gatewayRouteId, {
+      messageId,
+      normalizedText: safeText(message),
+      channel: 'qq',
+      images: qqInboundMessage(message, { fetchImpl: this.#fetchImpl }).images,
+    });
+    if (!result?.handled) return false;
+    for (const reply of result.replies ?? []) await this.#bot.sendText(message.replyTarget, reply);
+    await this.#state.markSeen(messageId);
+    this.#status.messagesReceived += 1;
+    this.#status.messagesReplied += result.replies?.length ? 1 : 0;
+    this.#status.lastMessageAt = new Date().toISOString();
+    this.#status.lastReplyAt = new Date().toISOString();
+    return true;
+  }
+
+  #recordGatewayInbound(message, messageId) {
+    if (!this.#dshImGatewayRegistry || !this.#botId) return;
+    try {
+      if (!this.#gatewayRouteId) {
+        const route = this.#dshImGatewayRegistry.upsertTrustedRoute({
+          channel: 'qq',
+          botId: this.#botId,
+          kind: 'direct',
+          conversationId: this.#ownerUserOpenid,
+          ownerId: this.#ownerUserOpenid,
+          adapterId: `qq:${this.#botId}`,
+          verification: { kind: 'configured-owner', verifiedAt: new Date().toISOString() },
+        });
+        this.#gatewayRouteId = route.routeId;
+      }
+      this.#dshImGatewayRegistry.recordInbound(this.#gatewayRouteId, {
+        messageId,
+        occurredAt: new Date().toISOString(),
+        normalizedText: safeText(message),
+      });
+    } catch (error) {
+      this.#logger.error?.('[dsh-im:qq] failed to record gateway inbound:', error);
+    }
+  }
+
+  #recordGatewayConversationReply(messageId, inputText, outputText) {
+    if (!this.#dshImGatewayRegistry?.recordConversationReply || !this.#gatewayRouteId) return;
+    try {
+      this.#dshImGatewayRegistry.recordConversationReply(this.#gatewayRouteId, {
+        messageId,
+        occurredAt: new Date().toISOString(),
+        inputText,
+        outputText,
+      });
+    } catch (error) {
+      this.#logger.warn?.('[dsh-im:qq] failed to record gateway conversation reply:', error);
+    }
+  }
+
+  get gatewayRouteId() {
+    return this.#gatewayRouteId;
   }
 
   #enqueueMessage(message, messageId, key, {
@@ -667,7 +763,7 @@ export class QqHarnessBridge {
       // QQ C2C keeps one stream bubble. Progress is collected but never submitted:
       // some clients reject replacing an already visible stream frame, which would
       // otherwise leave a stale progress bubble plus a separate fallback answer.
-      if (message.kind === 'c2c' && target?.msgId && typeof this.#bot.openStream === 'function') {
+      if (this.#maxMessageChars > 512 && message.kind === 'c2c' && target?.msgId && typeof this.#bot.openStream === 'function') {
         try {
           stream = this.#bot.openStream({ target });
         } catch (error) {
@@ -715,7 +811,7 @@ export class QqHarnessBridge {
         ]);
       }
       this.#signal?.throwIfAborted();
-      const answerText = answerTextForDelivery(answer, artifacts);
+      const answerText = cleanCompanionDraft(answerTextForDelivery(answer, artifacts));
       const displayAnswer = toolErrors.length > 0
         ? `${answerText}\n\n---\n\n${toolErrors.join('\n\n')}`
         : answerText;
@@ -743,9 +839,10 @@ export class QqHarnessBridge {
           }
         }
         if (!streamFinished) {
-          const deliveries = await sendMarkdownReply(this.#bot, target, displayAnswer, {
-            logger: this.#logger,
-          });
+          const deliveries = [];
+          for (const chunk of splitChatText(displayAnswer, this.#maxMessageChars)) {
+            deliveries.push(...await sendMarkdownReply(this.#bot, target, chunk, { logger: this.#logger }));
+          }
           textReceipt = createDeliveryReceipt({
             deliveryId: messageId,
             presentation: 'qq-text',
@@ -767,6 +864,7 @@ export class QqHarnessBridge {
       this.#status.messagesReplied += 1;
       this.#status.lastReplyAt = new Date().toISOString();
       this.#status.lastError = null;
+      if (textReceipt) this.#recordGatewayConversationReply(messageId, text, answerText);
       return delivery.receipt;
     } catch (error) {
       if (error?.code === 'turn-stopped') {

@@ -5,6 +5,7 @@ import {
   splitWeixinText,
   weixinMessageId,
 } from './weixin-api.mjs';
+import { createWeixinConfigCache } from './weixin-config-cache.mjs';
 import {
   harnessAnswerForQuestion,
   harnessQuestionText,
@@ -37,6 +38,7 @@ import {
   inboundFileUserMessage,
   prefetchInboundFiles,
 } from '../shared/inbound-file.mjs';
+import { cleanCompanionDraft } from '../shared/chat-text.mjs';
 import { rememberConnectionTestTarget } from '../shared/connection-test.mjs';
 import { deliverOutboundArtifacts } from '../shared/semantic/artifact-delivery.mjs';
 import {
@@ -68,6 +70,8 @@ const HELP_TEXT = () => [
   t('/stop  停止当前任务'),
   t('/steer 补充指令  纠偏当前任务'),
   t('/status  检查连接状态'),
+  t('/bqb  开始收集后续表情包'),
+  t('/bqb_end  结束收集表情包'),
   t('/help  显示本帮助'),
 ].join('\n');
 
@@ -173,6 +177,11 @@ export class WeixinHarnessBridge {
   #approvalTasks = new Set();
   #commandTasks = new Set();
   #approvals;
+  #dshImGatewayRegistry;
+  #botId;
+  #gatewayRouteId = null;
+  #configCache;
+  #outboundContexts = new Map();
 
   constructor({
     api,
@@ -186,6 +195,9 @@ export class WeixinHarnessBridge {
     replyTimeoutMs = 600_000,
     maxMessageChars = 4_000,
     signal,
+    dshImGatewayRegistry,
+    botId,
+    configCache,
   }) {
     if (!api || typeof api.sendText !== 'function') throw new TypeError('Weixin API is required');
     if (!baseUrl || !token || !ownerUserId) throw new TypeError('Weixin account credentials are required');
@@ -201,6 +213,9 @@ export class WeixinHarnessBridge {
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#maxMessageChars = maxMessageChars;
     this.#signal = signal;
+    this.#dshImGatewayRegistry = dshImGatewayRegistry;
+    this.#botId = botId;
+    this.#configCache = configCache ?? createWeixinConfigCache();
     this.#approvals = new HarnessApprovalQueue({ label: 'weixin', logger });
   }
 
@@ -209,6 +224,26 @@ export class WeixinHarnessBridge {
   }
 
   accept(message) {
+    if (this.#dshImGatewayRegistry?.dispatchInbound && message?.message_type !== 2
+      && nonEmptyString(message?.from_user_id) === this.#ownerUserId) {
+      const messageId = weixinMessageId(message);
+      if (messageId && !this.#state.hasSeen(messageId) && !this.#acceptedMessageIds.has(messageId)) {
+        this.#acceptedMessageIds.add(messageId);
+        this.#recordGatewayInbound(message, messageId);
+        const task = this.#dispatchGatewayInbound(message, messageId)
+          .then((handled) => {
+            if (handled) return undefined;
+            this.#acceptedMessageIds.delete(messageId);
+            return this.#acceptNormal(message, { skipGatewayRecord: true });
+          })
+          .finally(() => this.#acceptedMessageIds.delete(messageId));
+        return task;
+      }
+    }
+    return this.#acceptNormal(message);
+  }
+
+  #acceptNormal(message, { skipGatewayRecord = false } = {}) {
     if (this.#signal?.aborted) return Promise.resolve();
     if (message?.message_type === 2) return Promise.resolve();
     const messageId = weixinMessageId(message);
@@ -216,12 +251,16 @@ export class WeixinHarnessBridge {
     if (!messageId || !sender || this.#state.hasSeen(messageId)
       || this.#acceptedMessageIds.has(messageId)) return Promise.resolve();
     this.#acceptedMessageIds.add(messageId);
+    if (!skipGatewayRecord && sender === this.#ownerUserId) this.#recordGatewayInbound(message, messageId);
     if (sender === this.#ownerUserId) {
       rememberConnectionTestTarget(this.#state, { toUserId: sender });
     }
     const key = conversationKey(sender);
     const contextToken = nonEmptyString(message?.context_token) ?? undefined;
     const runId = nonEmptyString(message?.run_id) ?? undefined;
+    if (sender === this.#ownerUserId && contextToken) {
+      this.#outboundContexts.set(sender, { contextToken, runId, observedAt: Date.now() });
+    }
     const pending = this.#pendingInteractions.get(key);
     const commandText = nonEmptyString(extractWeixinText(message)) ?? '';
     const commandRunner = hasWeixinFileItems(message) ? null : isControlCommand(commandText)
@@ -306,6 +345,76 @@ export class WeixinHarnessBridge {
       return current;
     }
     return this.#enqueueMessage(message, messageId, key);
+  }
+
+  async #dispatchGatewayInbound(message, messageId) {
+    const images = weixinInboundMessage(message, this.#api).images;
+    const result = await this.#dshImGatewayRegistry.dispatchInbound(this.#gatewayRouteId, {
+      messageId,
+      normalizedText: extractWeixinText(message),
+      images,
+    });
+    if (!result?.handled) return false;
+    const sender = this.#ownerUserId;
+    const contextToken = nonEmptyString(message?.context_token) ?? undefined;
+    const runId = nonEmptyString(message?.run_id) ?? undefined;
+    for (const reply of result.replies ?? []) await this.#send(sender, reply, contextToken, runId);
+    await this.#state.markSeen(messageId);
+    this.#status.messagesReceived += 1;
+    this.#status.messagesReplied += result.replies?.length ? 1 : 0;
+    this.#status.lastMessageAt = new Date().toISOString();
+    this.#status.lastReplyAt = new Date().toISOString();
+    return true;
+  }
+
+  #recordGatewayInbound(message, messageId) {
+    if (!this.#dshImGatewayRegistry) return;
+    try {
+      if (!this.#gatewayRouteId) {
+        const route = this.#dshImGatewayRegistry.upsertTrustedRoute({
+          channel: 'weixin',
+          botId: this.#botId,
+          kind: 'direct',
+          conversationId: this.#ownerUserId,
+          ownerId: this.#ownerUserId,
+          adapterId: `weixin:${this.#botId}`,
+          verification: { kind: 'configured-owner', verifiedAt: new Date().toISOString() },
+        });
+        this.#gatewayRouteId = route.routeId;
+      }
+      this.#dshImGatewayRegistry.recordInbound(this.#gatewayRouteId, {
+        messageId,
+        occurredAt: new Date().toISOString(),
+        normalizedText: extractWeixinText(message),
+      });
+    } catch (error) {
+      this.#logger.error?.('[dsh-weixin] failed to record gateway inbound:', error);
+    }
+  }
+
+  #recordGatewayConversationReply(messageId, inputText, outputText) {
+    if (!this.#dshImGatewayRegistry?.recordConversationReply || !this.#gatewayRouteId) return;
+    try {
+      this.#dshImGatewayRegistry.recordConversationReply(this.#gatewayRouteId, {
+        messageId,
+        occurredAt: new Date().toISOString(),
+        inputText,
+        outputText,
+      });
+    } catch (error) {
+      this.#logger.warn?.('[dsh-weixin] failed to record gateway conversation reply:', error);
+    }
+  }
+
+  get gatewayRouteId() {
+    return this.#gatewayRouteId;
+  }
+
+  outboundContextFor(userId, maxAgeMs = 5 * 60_000) {
+    const key = nonEmptyString(userId);
+    const value = key ? this.#outboundContexts.get(key) : null;
+    if (!value || Date.now() - value.observedAt > maxAgeMs) return null;
+    return { contextToken: value.contextToken, runId: value.runId };
   }
 
   #enqueueMessage(message, messageId, key, {
@@ -395,6 +504,7 @@ export class WeixinHarnessBridge {
 
     const contextToken = typeof message.context_token === 'string' ? message.context_token : undefined;
     const runId = typeof message.run_id === 'string' ? message.run_id : undefined;
+    let typingTicket = '';
     try {
       const promptMessage = preparedMessage ?? weixinInboundMessage(message, this.#api);
       const text = promptMessage.content;
@@ -452,6 +562,36 @@ export class WeixinHarnessBridge {
       const content = hasImages
         ? await promptContentForMessage(promptMessage, { signal: this.#signal })
         : undefined;
+      if (typeof this.#api.getConfig === 'function' && typeof this.#api.sendTyping === 'function') {
+        typingTicket = await this.#configCache.getTypingTicket(
+          sender,
+          contextToken,
+          ({ userId, contextToken: tokenForConfig }) => this.#api.getConfig({
+            baseUrl: this.#baseUrl,
+            token: this.#token,
+            ilinkUserId: userId,
+            contextToken: tokenForConfig,
+            signal: this.#signal,
+          }),
+        );
+        if (!typingTicket) {
+          this.#logger.warn?.('[dsh-weixin] typing config unavailable; continuing reply');
+        }
+        if (typingTicket) {
+          try {
+            await this.#api.sendTyping({
+              baseUrl: this.#baseUrl,
+              token: this.#token,
+              ilinkUserId: sender,
+              typingTicket,
+              status: 1,
+              signal: this.#signal,
+            });
+          } catch {
+            this.#logger.warn?.('[dsh-weixin] typing start failed; continuing reply');
+          }
+        }
+      }
       let answer;
       let artifacts = [];
       try {
@@ -482,9 +622,9 @@ export class WeixinHarnessBridge {
           this.#approvals.closeRoute(key),
         ]);
       }
-      const answerText = typeof answer === 'string' && answer.trim()
+      const answerText = cleanCompanionDraft(typeof answer === 'string' && answer.trim()
         ? answer
-        : artifacts.length > 0 ? t('结果文件已生成。') : answer;
+        : artifacts.length > 0 ? t('结果文件已生成。') : answer);
       let textDeliveryError = null;
       let textReceipt = null;
       try {
@@ -510,6 +650,7 @@ export class WeixinHarnessBridge {
       this.#status.lastReplyAt = new Date().toISOString();
       this.#status.lastError = null;
       this.#status.lastMessageError = null;
+      if (textReceipt) this.#recordGatewayConversationReply(messageId, promptMessage.content, answerText);
       return delivery.receipt;
     } catch (error) {
       if (error?.code === 'turn-stopped') {
@@ -533,6 +674,21 @@ export class WeixinHarnessBridge {
         await this.#state.markSeen(messageId);
       } catch (sendError) {
         this.#logger.error?.('[dsh-weixin] failed to send the safe error reply:', sendError);
+      }
+    } finally {
+      if (typingTicket && typeof this.#api.sendTyping === 'function') {
+        try {
+          await this.#api.sendTyping({
+            baseUrl: this.#baseUrl,
+            token: this.#token,
+            ilinkUserId: sender,
+            typingTicket,
+            status: 2,
+            signal: this.#signal,
+          });
+        } catch {
+          this.#logger.warn?.('[dsh-weixin] typing stop failed');
+        }
       }
     }
   }
@@ -849,7 +1005,7 @@ export class WeixinHarnessBridge {
 
   async #send(toUserId, text, contextToken, runId) {
     const providerMessageIds = [];
-    for (const chunk of splitWeixinText(text, this.#maxMessageChars)) {
+    for (const chunk of splitWeixinText(cleanCompanionDraft(text), this.#maxMessageChars)) {
       const result = await this.#api.sendText({
         baseUrl: this.#baseUrl,
         token: this.#token,

@@ -82,6 +82,35 @@ const PNG_BYTES = Buffer.from([
   0x01, 0x02, 0x03,
 ]);
 
+test('Weixin captures a private sticker before Harness and replies through the bridge', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  const dispatched = [];
+  const registry = {
+    upsertTrustedRoute: () => ({ routeId: 'weixin-capture-route' }),
+    recordInbound: () => {},
+    dispatchInbound: async (_routeId, inbound) => {
+      dispatched.push(inbound);
+      return { handled: true, replies: ['收下了，第 1 张。'] };
+    },
+  };
+  const bridge = new WeixinHarnessBridge({
+    api: {
+      inboundImages: () => [{ name: 'sticker.png', mediaType: 'image/png', load: async () => PNG_BYTES }],
+      sendText: async ({ text }) => sent.push(text),
+    },
+    baseUrl: 'https://ilinkai.weixin.qq.com', token: 'token', ownerUserId: 'owner-user',
+    dshImGatewayRegistry: registry, botId: 'weixin-test', state: fixture.state,
+    harness: { ask: async () => { throw new Error('Harness must not be called'); } },
+  });
+  await bridge.accept(message('weixin-capture', '图片', { item_list: [{ type: 3, image_item: {} }] }));
+  assert.equal(dispatched.length, 1);
+  assert.equal(typeof dispatched[0].images[0].load, 'function');
+  assert.deepEqual(await dispatched[0].images[0].load({}), PNG_BYTES);
+  assert.deepEqual(sent, ['收下了，第 1 张。']);
+  assert.equal(fixture.seen.has('weixin-capture'), true);
+});
+
 test('Weixin bridge normalization keeps native file items separate from images', async () => {
   const bytes = Buffer.from('weixin-file');
   const source = { name: '微信文档.docx', load: async () => bytes };
@@ -1606,4 +1635,61 @@ test('bridge commands are local and internal failures return a generic message',
     at: status.lastMessageError.at,
   });
   assert.doesNotMatch(JSON.stringify(status.lastMessageError), /private path|secret|token-shaped/);
+});
+
+test('bridge sends typing start and stop around an ordinary Harness reply', async () => {
+  const fixture = stateFixture();
+  fixture.sessions.set('p2p:owner-user', 'session-typing');
+  const typing = [];
+  const bridge = new WeixinHarnessBridge({
+    api: {
+      getConfig: async () => ({ ret: 0, typing_ticket: 'ticket' }),
+      sendTyping: async (request) => typing.push(request.status),
+      sendText: async () => true,
+    },
+    baseUrl: 'https://ilinkai.weixin.qq.com/', token: 'token', ownerUserId: 'owner-user',
+    harness: { sessionExists: async () => true, ask: async () => '回复' }, state: fixture.state,
+  });
+  await bridge.accept(message('typing', '你好'));
+  assert.deepEqual(typing, [1, 2]);
+});
+
+test('bridge continues when getConfig fails', async () => {
+  const fixture = stateFixture();
+  fixture.sessions.set('p2p:owner-user', 'session-typing-failure');
+  const typing = [];
+  const sent = [];
+  const bridge = new WeixinHarnessBridge({
+    api: {
+      getConfig: async () => { throw new Error('config unavailable'); },
+      sendTyping: async (request) => typing.push(request.status),
+      sendText: async ({ text }) => sent.push(text),
+    },
+    baseUrl: 'https://ilinkai.weixin.qq.com/', token: 'token', ownerUserId: 'owner-user',
+    harness: { sessionExists: async () => true, ask: async () => '回复' }, state: fixture.state,
+    logger: { warn() {}, error() {} },
+  });
+  await bridge.accept(message('typing-failure', '你好'));
+  assert.deepEqual(typing, []);
+  assert.deepEqual(sent, ['回复']);
+});
+
+test('bridge stops typing when the Harness reply fails', async () => {
+  const fixture = stateFixture();
+  fixture.sessions.set('p2p:owner-user', 'session-typing-reply-failure');
+  const typing = [];
+  const sent = [];
+  const bridge = new WeixinHarnessBridge({
+    api: {
+      getConfig: async () => ({ ret: 0, typing_ticket: 'ticket' }),
+      sendTyping: async (request) => typing.push(request.status),
+      sendText: async ({ text }) => sent.push(text),
+    },
+    baseUrl: 'https://ilinkai.weixin.qq.com/', token: 'token', ownerUserId: 'owner-user',
+    harness: { sessionExists: async () => true, ask: async () => { throw new Error('reply failed'); } }, state: fixture.state,
+    logger: { warn() {}, error() {} },
+  });
+  await bridge.accept(message('typing-reply-failure', '你好'));
+  assert.deepEqual(typing, [1, 2]);
+  assert.deepEqual(sent, ['消息处理失败，请稍后重试。']);
 });

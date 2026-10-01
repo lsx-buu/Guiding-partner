@@ -1,0 +1,34 @@
+{
+  "name": "dsh-companion",
+  "version": "0.1.0",
+  "private": true,
+  "bin": { "dsh-companion": "src/cli.mjs" },
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./cli": "./src/cli.mjs",
+    "./memory": "./src/memory.mjs",
+    "./persona": "./src/persona.mjs",
+    "./policy": "./src/policy.mjs",
+    "./relationship": "./src/relationship.mjs",
+    "./scheduler": "./src/scheduler.mjs",
+    "./generator": "./src/generator.mjs",
+    "./memory-extractor": "./src/memory-extractor.mjs",
+    "./system-prompt": "./src/system-prompt.mjs",
+    "./topic": "./src/topic.mjs",
+    "./sticker": "./src/sticker.mjs",
+    "./sticker-collector": "./src/sticker-collector.mjs",
+    "./sticker-capture": "./src/sticker-capture.mjs",
+    "./sticker-annotator": "./src/sticker-annotator.mjs"
+  },
+  "files": ["src", "presets", "cordis.patch.yml", "README.md", "stickers.example.json"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" }
+  },
+  "engines": { "node": ">=22.19" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "npm test && node --check src/database.mjs && node --check src/store.mjs && node --check src/runtime.mjs && node --check src/index.mjs && node --check src/relationship.mjs && node --check src/policy.mjs && node --check src/persona.mjs && node --check src/memory.mjs && node --check src/cli.mjs && node --check src/scheduler.mjs && node --check src/generator.mjs && node --check src/topic.mjs && node --check src/sticker.mjs && node --check src/sticker-collector.mjs && node --check src/sticker-capture.mjs && node --check src/sticker-annotator.mjs && node --check src/memory-extractor.mjs && node --check src/system-prompt.mjs"
+  }
+}
